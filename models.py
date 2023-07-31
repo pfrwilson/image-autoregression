@@ -2,8 +2,6 @@
 Implementations of several autoregressive models described in 
 
 https://arxiv.org/pdf/1601.06759.pdf
-
-Author: Paul Wilson
 """
 
 import torch
@@ -14,6 +12,7 @@ from torch.nn import Conv2d
 from typing import Sequence
 from dataclasses import dataclass
 from typing import Literal
+import einops
 
 
 class LSTMCell(nn.Module):
@@ -58,7 +57,13 @@ class MaskedConvolution2D(nn.Module):
     """
 
     def __init__(
-        self, in_channels, out_channels, kernel_size, stride=1, padding=0, mask_type="B"
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        mask_type="B",
     ):
         super().__init__()
         self.conv2d = Conv2d(in_channels, out_channels, kernel_size, stride, padding)
@@ -73,33 +78,60 @@ class MaskedConvolution2D(nn.Module):
 
         mask = torch.ones_like(self.conv2d.weight)
         C_out, C_in, H, W = mask.shape
-        # mask all the context to the left
-        center_y = H // 2 + 1
-        center_x = W // 2 + 1
-        mask[:, :, center_y:, :] = 0
-        mask[:, :, :, center_x:] = 0
+        # mask all the context to the left and below, including the middle
+        center_y = H // 2
+        center_x = W // 2
+        mask[:, :, center_y + 1 :, :] = 0
+        mask[:, :, :, center_x + 1 :] = 0
 
         if mask_type == "A":
-            assert (
-                C_in % 3 == 0
-            ), f"""Mask type A assumes input channels can be split into RGB components, but
-                found {C_in} input channels, which is not divisible by 3."""
-            assert (
-                C_out % 3 == 0
-            ), f"""Mask type A assumes output channels can be split into RGB components, but
-                found {C_out} output channels, which is not divisible by 3."""
+            if C_in // 3:
+                C_in_color = C_in // 3
+                C_out_color = C_out // 3
 
-            C_in_color = C_in // 3
-            C_out_color = C_out // 3
+                # channels: RGB
 
-            # R can't look at G
-            mask[0:C_out_color, C_in_color : 2 * C_in_color, ...] = 0
-            # R can't look at B
-            mask[0:C_out_color, C_in_color * 2 : C_in_color * 3, ...] = 0
-            # G can't look at B
-            mask[
-                C_out_color : 2 * C_out_color, C_in_color * 2 : C_in_color * 3, ...
-            ] = 0
+                # first mask all between pixel connections
+                mask[:, :, center_y, center_x] = 0
+
+                # G can look at R
+                mask[C_out_color : C_out_color * 2, :C_in_color, center_y, center_x] = 1
+
+                # B can look at R and G
+                mask[
+                    C_out_color * 2 : C_out_color * 3,  # B output channel
+                    : C_in_color * 2,  # R and G input channel
+                    center_y,
+                    center_x,
+                ] = 1
+
+            if C_in == 1:
+                # Pixel can't look at itself
+                mask[:, :, center_y, center_x] = 0
+
+        else: 
+            if C_in // 3:
+                C_in_color = C_in // 3
+                C_out_color = C_out // 3
+
+                # channels: RGB
+
+                # first mask all between pixel connections
+                mask[:, :, center_y, center_x] = 0
+
+                # R can look at R 
+                mask[:C_out_color, :C_in_color, center_y, center_x] = 1 
+
+                # G can look at R and G
+                mask[C_out_color : C_out_color * 2, :C_in_color*2, center_y, center_x] = 1
+
+                # B can look at everything
+                mask[
+                    C_out_color * 2 : C_out_color * 3,  
+                    :,  
+                    center_y,
+                    center_x,
+                ] = 1
 
         self.register_buffer("mask", mask)
 
@@ -114,7 +146,7 @@ class PixelRNNLayer(nn.Module):
     Output: 1, c, h, w
     """
 
-    def __init__(self, in_features, out_features, row_kernel_size=3):
+    def __init__(self, in_features, out_features, row_kernel_size=3, rgb_input=True):
         super().__init__()
         self.input_to_state = MaskedConvolution2D(
             in_features,
@@ -122,6 +154,7 @@ class PixelRNNLayer(nn.Module):
             (1, row_kernel_size),
             stride=1,
             padding=(0, 1),
+            mask_type='B'
         )
         self.state_to_state = torch.nn.Conv1d(
             in_channels=out_features,
@@ -132,8 +165,10 @@ class PixelRNNLayer(nn.Module):
         )
         self.in_features = in_features
         self.out_features = out_features
+        self.rgb_input = rgb_input
 
-    def forward(self, X):
+    def forward(self, X, h=None, c=None):
+        
         B, C, H, W = X.shape
         input_to_state_whole_image = self.input_to_state(X)  # B, C, H, W
 
@@ -146,10 +181,29 @@ class PixelRNNLayer(nn.Module):
         for i in range(H):
             state_to_state = self.state_to_state(h)
 
-            # breakpoint()
             input_to_state = input_to_state_whole_image[:, :, i, :]
-            fiog = state_to_state + input_to_state
-            f, i, o, g = torch.split(fiog, self.out_features, dim=1)
+            gates = state_to_state + input_to_state
+
+            if self.rgb_input: 
+                r, g, b = torch.split(gates, gates.shape[1]//3, 1)
+                f_r, i_r, o_r, g_r = torch.split(r, r.shape[1]//4, 1)
+                f_g, i_g, o_g, g_g = torch.split(g, g.shape[1]//4, 1)
+                f_b, i_b, o_b, g_b = torch.split(b, b.shape[1]//4, 1)
+
+                f = torch.cat(
+                    [f_r, f_g, f_b], dim=1
+                )
+                i = torch.cat(
+                    [i_r, i_g, i_b], dim=1
+                )
+                o = torch.cat(
+                    [o_r, o_g, o_b], dim=1
+                )
+                g = torch.cat(
+                    [g_r, g_g, g_b], dim=1
+                )
+            else: 
+                f, i, o, g = torch.split(gates, self.out_features, dim=1)
 
             f = f.sigmoid()
             i = i.sigmoid()
@@ -184,7 +238,7 @@ class PixelRNN(nn.Module):
             out_channels=self.hidden_dim,
             kernel_size=(7, 7),
             padding=3,
-            mask_type="A" if in_channels == 3 else "B",
+            mask_type="A",
         )
 
         self.rnn_layers = nn.ModuleList()
@@ -194,10 +248,11 @@ class PixelRNN(nn.Module):
                     in_features=self.hidden_dim,
                     out_features=self.hidden_dim,
                     row_kernel_size=3,
+                    rgb_input=in_channels==3,
                 )
             )
 
-        self.output_conv = nn.Conv2d(
+        self.output_conv = MaskedConvolution2D(
             in_channels=self.hidden_dim,
             out_channels=self.out_channels,
             kernel_size=(1, 1),
@@ -217,8 +272,17 @@ class PixelRNN(nn.Module):
         return X
 
 
+class ConditionalPixelRNN(PixelRNN):
+    ...
+
+
 if __name__ == "__main__":
-    model = PixelRNN(in_channels=1, hidden_dim_per_pixel=32, n_layers=1)
-    input_data=(torch.randn(1, 1, 28, 28))
-    input_data.requires_grad = True 
-    
+    ...
+    # model = PixelRNN(in_channels=1, hidden_dim=32, n_layers=1)
+    # input_data = torch.randn(1, 1, 28, 28)
+    # input_data.requires_grad = True
+# 
+    conv = MaskedConvolution2D(
+        in_channels=3, out_channels=6, kernel_size=(3, 3), mask_type="A"
+    )
+    breakpoint()
