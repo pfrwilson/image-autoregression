@@ -271,7 +271,7 @@ def create_dataset(args: Args):
         return img
 
     import json
-    with open('dataset_paths.json') as f: 
+    with open('data/dataset_paths.json') as f: 
         paths = json.load(f)
 
     if args.dataset == 'cifar10':
