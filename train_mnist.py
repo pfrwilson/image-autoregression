@@ -1,12 +1,21 @@
+"""
+Reimplementation from scratch of the MNIST Experiments from 
+``Pixel Recurrent Neural Networks``
+https://arxiv.org/pdf/1601.06759.pdf
+
+Author: Paul Wilson
+"""
+
 import torch 
 import einops
-from simple_parsing import parse
+from simple_parsing import parse, ArgumentParser
 from tqdm import tqdm
 from rich import print as pprint
 from dataclasses import dataclass
 import matplotlib.pyplot as plt 
 import wandb 
 from os.path import join 
+import os
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -20,7 +29,7 @@ class Args:
     lr: float = 1e-4
 
     sample_image_every_n_epochs: int = 10
-    temperature: float = 3
+    temperature: float = 1
 
     n_layers: int = 4
 
@@ -29,6 +38,8 @@ class Args:
     
 
 def train(args: Args):
+    os.makedirs(args.exp_dir, exist_ok=True)
+
     # wandb.init(project='image-autoregression', name='pixelrnn_debug')
     train_loader, eval_loader = create_dataset(args)
     sample_batch = next(iter(train_loader))
@@ -50,6 +61,9 @@ def train(args: Args):
             n_samples = 8
             
             fig, ax = plt.subplots(4, n_samples)
+            for ax_ in ax.flatten(): 
+                ax_: plt.Axes 
+                ax_.set_axis_off()
 
             prompts = torch.stack([eval_loader.dataset[i][0] for i in range(n_samples)])
 
@@ -59,6 +73,7 @@ def train(args: Args):
                     sample = samples[i][0].numpy()
                     ax[row, i].imshow(sample)
 
+            fig.tight_layout()
             plt.savefig(f'logs/epoch{epoch}.png')
             plt.close()
 
@@ -93,6 +108,7 @@ def generate_examples(model, prompts, startpos=(0, 0), temperature=1):
             # we need to scale this and make it into a float 
             # now we can set the corresponding pixel value in the image 
             image[:, 0, i, j] = pixel_sample 
+            
     
     return image.cpu()
 
@@ -120,20 +136,18 @@ def run_epoch(args, model, loader, optimizer=None):
             target = einops.rearrange(target, 'b c h w -> (b h w) c')
             target = target.squeeze(-1)
             
-            # breakpoint()
-
-            loss_step = torch.nn.functional.binary_cross_entropy(pixel_probs, target)
+            loss_step = torch.nn.functional.binary_cross_entropy(pixel_probs, target, reduction='sum')
+            total_items += B 
 
             if training: 
                 loss_step.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
-            total_items += B 
             loss_epoch += loss_step.item()
 
     return {
-        'loss': loss_epoch / total_items
+        'nll': loss_epoch / total_items,
     }
 
 
@@ -165,6 +179,13 @@ def create_dataset(args: Args):
     return train_loader, val_loader
 
 
+def add_arguments(parser=None):
+    parser = parser or ArgumentParser()
+    parser.add_arguments(Args, dest='train')
+    return parser 
+
+
 if __name__ == "__main__": 
-    args = parse(Args)
-    train(args)
+    parser = add_arguments()
+    args = parser.parse_args()
+    train(args.train)
